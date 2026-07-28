@@ -126,19 +126,39 @@ def polymarket_yes_price(market):
 
 # ---------------- MATCHING ----------------
 
+MATCH_THRESHOLD = float(os.environ.get("MATCH_THRESHOLD", "0.25"))
+DEBUG_MATCHING = os.environ.get("DEBUG_MATCHING", "true").lower() == "true"
+
+
+def kalshi_title(km):
+    for field in ("title", "subtitle", "yes_sub_title", "ticker"):
+        val = km.get(field)
+        if val:
+            return val
+    return ""
+
+
+def poly_title(pm):
+    for field in ("question", "title", "slug"):
+        val = pm.get(field)
+        if val:
+            return val
+    return ""
+
+
 def match_markets(kalshi_markets, poly_markets):
     """Fuzzy-match Kalshi and Polymarket markets by title token overlap."""
     poly_indexed = []
     for pm in poly_markets:
-        title = pm.get("question") or pm.get("title") or ""
-        tokens = normalize_title(title)
+        tokens = normalize_title(poly_title(pm))
         if tokens:
             poly_indexed.append((tokens, pm))
 
     pairs = []
+    near_misses = []
+
     for km in kalshi_markets:
-        k_title = km.get("title") or km.get("subtitle") or ""
-        k_tokens = normalize_title(k_title)
+        k_tokens = normalize_title(kalshi_title(km))
         if not k_tokens:
             continue
         best_match = None
@@ -150,8 +170,17 @@ def match_markets(kalshi_markets, poly_markets):
             if score > best_score:
                 best_score = score
                 best_match = pm
-        if best_match and best_score >= 0.5:  # require strong title overlap
+        if best_match and best_score >= MATCH_THRESHOLD:
             pairs.append((km, best_match, best_score))
+        elif best_match and best_score > 0:
+            near_misses.append((best_score, kalshi_title(km), poly_title(best_match)))
+
+    if DEBUG_MATCHING and not pairs and near_misses:
+        near_misses.sort(reverse=True)
+        print("No matches cleared threshold. Top 5 near-misses:", flush=True)
+        for score, kt, pt in near_misses[:5]:
+            print(f"  score={score:.2f} | Kalshi: '{kt}' | Poly: '{pt}'", flush=True)
+
     return pairs
 
 
