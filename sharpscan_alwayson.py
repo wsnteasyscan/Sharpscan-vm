@@ -48,13 +48,43 @@ def normalize_title(title):
     return set(tokens)
 
 
+# ---------------- SPORTS FILTERING ----------------
+
+SPORTS_TICKER_PREFIXES = (
+    "KXMLBGAME", "KXNBAGAME", "KXNFLGAME", "KXNHLGAME",
+    "KXNCAAFGAME", "KXNCAABGAME", "KXSOCCER", "KXUFC",
+    "KXATP", "KXWTA", "KXGOLF",
+)
+
+POLITICAL_KEYWORDS = (
+    "president", "election", "senate", "congress", "governor",
+    "fed ", "federal reserve", "impeach", "supreme court",
+)
+
+
+def is_kalshi_sports_market(km):
+    ticker = km.get("ticker", "") or km.get("event_ticker", "")
+    return any(ticker.startswith(p) for p in SPORTS_TICKER_PREFIXES)
+
+
+def is_poly_sports_market(pm):
+    text = (poly_title(pm) or "").lower()
+    if any(kw in text for kw in POLITICAL_KEYWORDS):
+        return False
+    tags = pm.get("tags") or []
+    tag_text = " ".join(str(t) for t in tags).lower()
+    if "sports" in tag_text or "sport" in tag_text:
+        return True
+    return "tags" not in pm
+
+
 # ---------------- FETCHERS ----------------
 
 def fetch_kalshi_markets():
-    """Fetch all open Kalshi markets (sports category)."""
+    """Fetch all open Kalshi markets, filtered to game-level sports markets."""
     markets = []
     cursor = None
-    for _ in range(20):  # safety cap on pagination
+    for _ in range(20):
         params = {"status": "open", "limit": 200}
         if cursor:
             params["cursor"] = cursor
@@ -69,15 +99,17 @@ def fetch_kalshi_markets():
         cursor = data.get("cursor")
         if not cursor:
             break
-    return markets
+    filtered = [m for m in markets if is_kalshi_sports_market(m)]
+    print(f"Kalshi: {len(markets)} total open -> {len(filtered)} sports game markets", flush=True)
+    return filtered
 
 
 def fetch_polymarket_markets():
-    """Fetch all active Polymarket markets."""
+    """Fetch active Polymarket markets, filtered to sports / non-political."""
     markets = []
     offset = 0
     limit = 200
-    for _ in range(20):
+    for _ in range(30):
         params = {"active": "true", "closed": "false", "limit": limit, "offset": offset}
         try:
             r = requests.get(f"{POLY_BASE}/markets", params=params, timeout=15)
@@ -92,7 +124,9 @@ def fetch_polymarket_markets():
         if len(batch) < limit:
             break
         offset += limit
-    return markets
+    filtered = [m for m in markets if is_poly_sports_market(m)]
+    print(f"Polymarket: {len(markets)} total active -> {len(filtered)} sports candidates", flush=True)
+    return filtered
 
 
 def kalshi_yes_price(market):
@@ -131,6 +165,8 @@ DEBUG_MATCHING = os.environ.get("DEBUG_MATCHING", "true").lower() == "true"
 
 
 def kalshi_title(km):
+    # Market-level title is often blank; fall back through every field that
+    # might carry the human-readable question text.
     for field in ("title", "subtitle", "yes_sub_title", "ticker"):
         val = km.get(field)
         if val:
@@ -155,7 +191,7 @@ def match_markets(kalshi_markets, poly_markets):
             poly_indexed.append((tokens, pm))
 
     pairs = []
-    near_misses = []
+    near_misses = []  # (score, k_title, p_title) for the best-scoring non-matches
 
     for km in kalshi_markets:
         k_tokens = normalize_title(kalshi_title(km))
