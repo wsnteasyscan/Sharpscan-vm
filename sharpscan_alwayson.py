@@ -1,131 +1,198 @@
-"""
-SharpScan Always-On Scanner
-Runs continuously on a VM. Polls slowly outside live windows, fast during them.
-Pushes phone alerts via ntfy.sh when a real gap is detected.
-"""
-
 import requests
+import time
 import csv
 import os
-import time
+import re
 from datetime import datetime, timezone
 
-KALSHI_BASE = "https://external-api.kalshi.com/trade-api/v2"
-POLYMARKET_GAMMA = "https://gamma-api.polymarket.com"
+# ---------------- CONFIG ----------------
+GAP_ALERT_THRESHOLD = float(os.environ.get("GAP_ALERT_THRESHOLD", "0.03"))
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
 LOG_FILE = "sharpscan_log.csv"
 
-NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
-GAP_ALERT_THRESHOLD = float(os.environ.get("GAP_ALERT_THRESHOLD", "0.03"))
+KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+POLY_BASE = "https://gamma-api.polymarket.com"
 
-SLOW_POLL_SECONDS = 300   # 5 min, outside live windows
-FAST_POLL_SECONDS = 15    # during live windows
+STOPWORDS = {
+    "the", "vs", "at", "in", "on", "to", "win", "will", "game",
+    "match", "series", "championship", "final", "finals", "game1",
+    "of", "a", "for", "2025", "2026"
+}
 
-# Fill in real tickers/slugs. Times in UTC. Add a buffer on either side.
-WATCHED_PAIRS = [
-    {
-        "label": "Example Game - replace me",
-        "kalshi_ticker": "KXMLBGAME-PLACEHOLDER",
-        "polymarket_slug": "mlb-placeholder-2026-01-01",
-        "live_start": "2026-01-01T00:00:00+00:00",
-        "live_end":   "2026-01-01T04:00:00+00:00",
-    },
-]
+# ---------------- HELPERS ----------------
 
-
-def in_live_window(pair, now):
-    start = datetime.fromisoformat(pair["live_start"])
-    end = datetime.fromisoformat(pair["live_end"])
-    return start <= now <= end
-
-
-def notify_phone(message):
-    if not NTFY_TOPIC:
-        return
-    try:
-        requests.post(f"https://ntfy.sh/{NTFY_TOPIC}", data=message.encode("utf-8"), timeout=5)
-    except Exception as e:
-        print(f"Notify failed: {e}")
-
-
-def get_kalshi_price(ticker):
-    resp = requests.get(f"{KALSHI_BASE}/markets/{ticker}", timeout=10)
-    resp.raise_for_status()
-    m = resp.json()["market"]
-    return {
-        "ticker": m["ticker"],
-        "yes_bid": float(m["yes_bid_dollars"]),
-        "yes_ask": float(m["yes_ask_dollars"]),
-        "mid": (float(m["yes_bid_dollars"]) + float(m["yes_ask_dollars"])) / 2,
-    }
-
-
-def get_polymarket_price(slug):
-    resp = requests.get(f"{POLYMARKET_GAMMA}/markets", params={"slug": slug}, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-    if not data:
-        return None
-    m = data[0]
-    price = float(m["outcomePrices"][0])
-    return {"question": m["question"], "mid": price}
-
-
-def log_row(pair_label, kalshi_data, poly_data, spread):
-    file_exists = os.path.isfile(LOG_FILE)
+def log_row(row):
+    exists = os.path.exists(LOG_FILE)
     with open(LOG_FILE, "a", newline="") as f:
         writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(["timestamp_utc", "pair", "kalshi_mid", "polymarket_mid", "spread"])
-        writer.writerow([
-            datetime.now(timezone.utc).isoformat(),
-            pair_label,
-            kalshi_data["mid"],
-            poly_data["mid"],
-            round(spread, 4),
-        ])
+        if not exists:
+            writer.writerow(["timestamp", "kalshi_ticker", "polymarket_slug",
+                              "kalshi_price", "polymarket_price", "gap"])
+        writer.writerow(row)
 
 
-def scan_once():
-    now = datetime.now(timezone.utc)
-    any_live = False
-
-    for pair in WATCHED_PAIRS:
-        live = in_live_window(pair, now)
-        any_live = any_live or live
+def send_alert(msg):
+    print(f"[ALERT] {msg}", flush=True)
+    if NTFY_TOPIC:
         try:
-            k = get_kalshi_price(pair["kalshi_ticker"])
-            p = get_polymarket_price(pair["polymarket_slug"])
-            if not k or not p:
-                print(f"[{pair['label']}] Missing data")
-                continue
-
-            spread = abs(k["mid"] - p["mid"])
-            log_row(pair["label"], k, p, spread)
-
-            tag = " [LIVE]" if live else ""
-            flag = " <-- GAP" if spread >= GAP_ALERT_THRESHOLD else ""
-            print(f"{tag}[{pair['label']}] Kalshi {k['mid']:.3f} | "
-                  f"Polymarket {p['mid']:.3f} | Spread {spread:.3f}{flag}")
-
-            if spread >= GAP_ALERT_THRESHOLD:
-                notify_phone(
-                    f"SharpScan gap: {pair['label']}\n"
-                    f"Kalshi {k['mid']:.2f} vs Polymarket {p['mid']:.2f} "
-                    f"(spread {spread:.3f}){' LIVE' if live else ''}"
-                )
+            requests.post(f"https://ntfy.sh/{NTFY_TOPIC}", data=msg.encode("utf-8"), timeout=10)
         except Exception as e:
-            print(f"[{pair['label']}] Error: {e}")
-
-    return any_live
+            print(f"ntfy push failed: {e}", flush=True)
 
 
-def main():
-    print("SharpScan always-on scanner starting...")
-    notify_phone("SharpScan scanner started and running.")
-    while True:
-        live = scan_once()
-        time.sleep(FAST_POLL_SECONDS if live else SLOW_POLL_SECONDS)
+def normalize_title(title):
+    title = title.lower()
+    title = re.sub(r"[^a-z0-9\s]", " ", title)
+    tokens = [t for t in title.split() if t not in STOPWORDS and len(t) > 2]
+    return set(tokens)
+
+
+# ---------------- FETCHERS ----------------
+
+def fetch_kalshi_markets():
+    """Fetch all open Kalshi markets (sports category)."""
+    markets = []
+    cursor = None
+    for _ in range(20):  # safety cap on pagination
+        params = {"status": "open", "limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            r = requests.get(f"{KALSHI_BASE}/markets", params=params, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            print(f"Kalshi fetch error: {e}", flush=True)
+            break
+        markets.extend(data.get("markets", []))
+        cursor = data.get("cursor")
+        if not cursor:
+            break
+    return markets
+
+
+def fetch_polymarket_markets():
+    """Fetch all active Polymarket markets."""
+    markets = []
+    offset = 0
+    limit = 200
+    for _ in range(20):
+        params = {"active": "true", "closed": "false", "limit": limit, "offset": offset}
+        try:
+            r = requests.get(f"{POLY_BASE}/markets", params=params, timeout=15)
+            r.raise_for_status()
+            batch = r.json()
+        except Exception as e:
+            print(f"Polymarket fetch error: {e}", flush=True)
+            break
+        if not batch:
+            break
+        markets.extend(batch)
+        if len(batch) < limit:
+            break
+        offset += limit
+    return markets
+
+
+def kalshi_yes_price(market):
+    """Return implied YES probability 0-1 from Kalshi market dict."""
+    try:
+        bid = market.get("yes_bid")
+        ask = market.get("yes_ask")
+        if bid is not None and ask is not None and bid > 0 and ask > 0:
+            return (bid + ask) / 2 / 100.0
+        last = market.get("last_price")
+        if last:
+            return last / 100.0
+    except Exception:
+        pass
+    return None
+
+
+def polymarket_yes_price(market):
+    """Return implied YES probability 0-1 from Polymarket market dict."""
+    try:
+        prices = market.get("outcomePrices")
+        if isinstance(prices, str):
+            import json
+            prices = json.loads(prices)
+        if prices and len(prices) > 0:
+            return float(prices[0])
+    except Exception:
+        pass
+    return None
+
+
+# ---------------- MATCHING ----------------
+
+def match_markets(kalshi_markets, poly_markets):
+    """Fuzzy-match Kalshi and Polymarket markets by title token overlap."""
+    poly_indexed = []
+    for pm in poly_markets:
+        title = pm.get("question") or pm.get("title") or ""
+        tokens = normalize_title(title)
+        if tokens:
+            poly_indexed.append((tokens, pm))
+
+    pairs = []
+    for km in kalshi_markets:
+        k_title = km.get("title") or km.get("subtitle") or ""
+        k_tokens = normalize_title(k_title)
+        if not k_tokens:
+            continue
+        best_match = None
+        best_score = 0
+        for tokens, pm in poly_indexed:
+            overlap = len(k_tokens & tokens)
+            union = len(k_tokens | tokens)
+            score = overlap / union if union else 0
+            if score > best_score:
+                best_score = score
+                best_match = pm
+        if best_match and best_score >= 0.5:  # require strong title overlap
+            pairs.append((km, best_match, best_score))
+    return pairs
+
+
+# ---------------- MAIN LOOP ----------------
+
+def run_scan():
+    print(f"Fetching markets @ {datetime.now(timezone.utc).isoformat()}", flush=True)
+    kalshi_markets = fetch_kalshi_markets()
+    poly_markets = fetch_polymarket_markets()
+    print(f"Kalshi open markets: {len(kalshi_markets)} | Polymarket active markets: {len(poly_markets)}", flush=True)
+
+    pairs = match_markets(kalshi_markets, poly_markets)
+    print(f"Matched {len(pairs)} cross-venue pairs this cycle", flush=True)
+
+    for km, pm, score in pairs:
+        k_price = kalshi_yes_price(km)
+        p_price = polymarket_yes_price(pm)
+        if k_price is None or p_price is None:
+            continue
+
+        gap = abs(k_price - p_price)
+        if gap >= GAP_ALERT_THRESHOLD:
+            k_ticker = km.get("ticker", "?")
+            p_slug = pm.get("slug", "?")
+            msg = (f"GAP {gap:.1%} | {k_ticker} (Kalshi {k_price:.1%}) "
+                   f"vs {p_slug} (Poly {p_price:.1%}) | match={score:.2f}")
+            send_alert(msg)
+            log_row([datetime.now(timezone.utc).isoformat(), k_ticker, p_slug,
+                      f"{k_price:.4f}", f"{p_price:.4f}", f"{gap:.4f}"])
 
 
 if __name__ == "__main__":
-    main()
+    print("SharpScan always-on scanner starting (auto-discovery mode)...", flush=True)
+    if NTFY_TOPIC:
+        send_alert("SharpScan scanner online — auto-discovery mode active.")
+    else:
+        print("WARNING: NTFY_TOPIC not set, phone alerts disabled.", flush=True)
+
+    while True:
+        try:
+            run_scan()
+        except Exception as e:
+            print(f"Scan cycle error: {e}", flush=True)
+        time.sleep(POLL_SECONDS)
